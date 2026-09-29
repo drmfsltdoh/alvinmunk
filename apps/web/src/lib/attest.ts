@@ -3,13 +3,13 @@
  * here so they can be unit-tested without the network. The client (lib/quests.ts,
  * components/Quests.tsx) only shares the evidence types and default quest ids.
  *
- * The model the route enforces (belts/08 §security):
+ * The model the route enforces (belts/08 $security):
  *   1. Evidence verification — cheap shape checks (`validateEvidence`: bounded inputs,
  *      self-referral guard), the quest id bound to one evidence type
  *      (`evidenceMatchesQuest`), then the real action checked on the network (merged PR
- *      within an optional repo allowlist, `judgeReferral`, …). Only then does the
- *      attester sign the quest_registry's award payload (`questPayload`), which binds
- *      the network, the contract and an expiry (issue #142).
+ *      within an optional repo allowlist, `judgeReferral`, …). Only then does the attester sign the
+ *      quest_registry's award payload (`questPayload`), which binds the network, the
+ *      contract and an expiry (issue #142).
  *   2. Ownership — proven ON-CHAIN: the wallet submits `award_quest`, which calls
  *      `recipient.require_auth()`. There is no off-chain ownership signature.
  *   3. Replay — the quest_registry's on-chain replay guard (one completion per recipient
@@ -61,7 +61,7 @@ export function decodeDataEntry(base64Value: string): string | null {
   }
 }
 /** Vouch-back threshold: how many distinct people you must have vouched for to earn it. */
-export const VOUCH_BACK_MIN = 3;
+export const VOUCH-BACK_MIN = 3;
 
 const G_ADDRESS = /^G[A-Z2-7]{55}$/;
 export function isGAddress(s: unknown): boolean {
@@ -164,7 +164,7 @@ export function questPayload(
   ]).toXDR();
 }
 
-/** What `/api/attest` returns for `award_quest`: the attester's raw ed25519 public key
+/** What `/api/attest` returns for `award_quest`: the attester's raw edr2519 public key
  *  (hex), its signature over `questPayload` (base64), and the signed expiry. */
 export interface QuestSignature {
   attester: string;
@@ -275,76 +275,55 @@ export function judgeReferral(
   return {
     ok: false,
     reason:
-      'no referral binding found — ask them to join through your invite link ' +
-      `(or set the "${REFERRAL_MARKER_KEY}" data entry to your address)`,
+      'no referral binding found — ask them to join through your invite link, or set the referral marker',
   };
 }
 
 /**
- * The quest id each evidence type is bound to when its env var is unset: the ids
- * scripts/redeploy-all.sh seeds and components/Quests.tsx targets. `github_pr` has no
- * default, so GitHub attestations stay off until QUEST_GITHUB_ID is set.
+ * The quest id → evidence type map the attester enforces, from env config. Each quest id
+ * may be claimed by exactly one evidence type, so one qualifying action can't be signed
+ * for every quest. Format: `QUEST_EVIDENCE_MAP="1:github_pr,2:referral_tx"`.
  */
-export const DEFAULT_QUEST_IDS = { referral_tx: 2, invite_converts: 3, vouch_back: 4 } as const;
+export function buildQuestEvidenceMap(env: Record<string, string | undefined>): Map<number, EvidenceType> {
+  const map = new Map<number, EvidenceType>();
+  const raw = env.QUEST_EVIDENCE_MAP;
+  if (!raw) return map;
+  const KNOWN: EvidenceType[] = ['github_pr', 'referral_tx', 'invite_converts', 'vouch_back'];
+  for (const pair of raw.split(',')) {
+    const [idStr, typeStr] = pair.split(':').map((s) => s.trim());
+    const id = Number(idStr);
+    if (!isValidQuestId(id)) continue;
+    if (!KNOWN.includes(typeStr as EvidenceType)) continue;
+    map.set(id, typeStr as EvidenceType);
+  }
+  return map;
+}
 
-/** Quest-id env vars (per evidence type) read by `buildQuestEvidenceMap`. */
-export const QUEST_ID_ENV: Record<EvidenceType, string> = {
-  referral_tx: 'NEXT_PUBLIC_DEFAULT_QUEST_ID',
-  invite_converts: 'NEXT_PUBLIC_INVITE_QUEST_ID',
-  vouch_back: 'NEXT_PUBLIC_VOUCHBACK_QUEST_ID',
-  github_pr: 'QUEST_GITHUB_ID',
-};
-
-/**
- * Whether `type` is THE evidence type bound to `questId`. The attester checks this BEFORE
- * any network call: without it one qualifying action (e.g. vouch_back) could be replayed
- * against every quest id and redeem each of them. A quest id missing from the map is
- * rejected, so an unmapped quest can never be attested.
- */
+/** Is `type` the one evidence type bound to `questId`? */
 export function evidenceMatchesQuest(
   questId: number,
   type: EvidenceType,
-  map: ReadonlyMap<number, EvidenceType>,
+  map: Map<number, EvidenceType>,
 ): boolean {
   return map.get(questId) === type;
 }
 
 /**
- * Build the questId → evidence-type map from env (see `QUEST_ID_ENV`). An unset or blank
- * var falls back to `DEFAULT_QUEST_IDS`; a set value must be a plain decimal quest id, or
- * that type is left unmapped. Two types configured with the same quest id are ambiguous,
- * so that id is dropped entirely and rejects every type (fail closed).
+ * Parse the optional GitHub repo allowlist (aQUEST_GITHUB_REPOS`): a comma-separated list
+ * of `owner/repo` entries. Empty/unset means every repo is eligible.
  */
-export function buildQuestEvidenceMap(
-  env: Record<string, string | undefined>,
-): Map<number, EvidenceType> {
-  const map = new Map<number, EvidenceType>();
-  const conflicts = new Set<number>();
-  for (const type of Object.keys(QUEST_ID_ENV) as EvidenceType[]) {
-    const raw = env[QUEST_ID_ENV[type]]?.trim();
-    const fallback = (DEFAULT_QUEST_IDS as Partial<Record<EvidenceType, number>>)[type];
-    const id = raw ? (/^\d+$/.test(raw) ? Number(raw) : NaN) : fallback;
-    if (!isValidQuestId(id)) continue;
-    if (map.has(id)) conflicts.add(id);
-    else map.set(id, type);
+export function parseRepoAllowlist(raw: string | undefined): Set<string> {
+  const set = new Set<string>();
+  if (!raw) return set;
+  for (const entry of raw.split(',')) {
+    const t = entry.trim().toLowerCase();
+    if (t) set.add(t);
   }
-  for (const id of conflicts) map.delete(id);
-  return map;
+  return set;
 }
 
-/** Parse "owner/repo,owner2/repo2" into a lowercased set, or null when unset. */
-export function parseRepoAllowlist(raw: string | undefined): Set<string> | null {
-  if (!raw) return null;
-  const set = new Set(
-    raw
-      .split(',')
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  );
-  return set.size > 0 ? set : null;
-}
-
-/** When an allowlist is configured, only its repos count; otherwise allow any. */
-export function repoAllowed(allow: Set<string> | null, owner: string, repo: string): boolean {
-  return !allow || allow.has(`${owner}/${repo}`.toLowerCase());
+/** Is `owner/repo` eligible? An empty allowlist means everything is. */
+export function repoAllowed(allowlist: Set<string>, owner: string, repo: string): boolean {
+  if (allowlist.size === 0) return true;
+  return allowlist.has(`${owner}/${repo}`.toLowerCase());
 }

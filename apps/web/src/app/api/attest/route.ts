@@ -46,6 +46,7 @@ import {
   isValidQuestId,
   judgeReferral,
   parseRepoAllowlist,
+  questEpoch,
   questWindow,
   repoAllowed,
   signQuestPayload,
@@ -159,6 +160,7 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
   const evidence = body.evidence as AttestEvidence;
   const nowSecs = Math.floor(now / 1000);
   const window = questWindow(nowSecs, await questPeriod(body.questId));
+  const epoch = questEpoch(nowSecs, window);
   if (window && !FRESH_EVIDENCE.has(evidence.type)) {
     return json({ error: 'this quest repeats, and a referral can’t be dated to this round' }, 422);
   }
@@ -169,7 +171,7 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
   // GitHub/Horizon/RPC quota spent and nothing signed. One read of `is_completed`; if it
   // fails or the deployed contract predates the view, carry on — the on-chain guard still
   // refuses the award.
-  if (await questCompleted(body.questId, body.recipient)) {
+  if (await questCompleted(body.questId, body.recipient, epoch)) {
     return json({ error: `You’ve already completed this quest${round}.` }, 409);
   }
 
@@ -190,7 +192,7 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
   try {
     const expiresAt = signatureExpiry(nowSecs, window);
     const ctx = { contractId: QUEST_ID, passphrase: PASSPHRASE };
-    const signed = signQuestPayload(secret, ctx, body.questId, body.recipient, expiresAt, window);
+    const signed = signQuestPayload(secret, ctx, body.questId, body.recipient, expiresAt, window, epoch);
     return json({ ok: true, ...signed, recipient: body.recipient, questId: body.questId });
   } catch (e) {
     return json({ error: e instanceof Error ? e.message : 'sign failed' }, 500);
@@ -527,7 +529,7 @@ async function questPeriod(questId: number): Promise<number> {
  * for any reason (RPC error, or a deployed contract without the view): this is only an
  * early exit, never the guard itself.
  */
-async function questCompleted(questId: number, addr: string): Promise<boolean> {
+async function questCompleted(questId: number, addr: string, epoch: number): Promise<boolean> {
   try {
     const server = new rpc.Server(RPC_URL, { allowHttp: RPC_URL.startsWith('http://') });
     const source = new Account(Keypair.random().publicKey(), '0');
@@ -537,6 +539,7 @@ async function questCompleted(questId: number, addr: string): Promise<boolean> {
           'is_completed',
           nativeToScVal(questId, { type: 'u32' }),
           new Address(addr).toScVal(),
+          nativeToScVal(epoch, { type: 'u32' }),
         ),
       )
       .setTimeout(30)

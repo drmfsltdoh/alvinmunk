@@ -37,13 +37,11 @@ fn setup_in(env: Env) -> Fixture<'static> {
     let attester_sk = signing_key(7);
     let attester_pub = BytesN::from_array(&env, &attester_sk.verifying_key().to_bytes());
 
-    let rep_id = env.register(ReputationContract, ());
+    let rep_id = env.register(ReputationContract, (&admin,));
     let rep = ReputationContractClient::new(&env, &rep_id);
-    rep.init(&admin);
 
-    let quest_id = env.register(QuestRegistryContract, ());
+    let quest_id = env.register(QuestRegistryContract, (&admin, &rep_id));
     let quest = QuestRegistryContractClient::new(&env, &quest_id);
-    quest.init(&admin, &rep_id);
 
     // Wire: the QuestRegistry CONTRACT is an allowlisted attester in Reputation (for the
     // award_xp cross-call); the off-chain attester ed25519 PUBKEY is allowlisted here.
@@ -66,6 +64,12 @@ const SIG_TTL: u64 = 600;
 /// usual expiry (`SIG_TTL` from now).
 fn award(f: &Fixture, sk: &SigningKey, quest_id: u32, recipient: &Address) {
     try_award(f, sk, quest_id, recipient).unwrap();
+}
+
+/// Create a quest with a replay period. `period_secs == 0` is one-shot.
+fn create_quest_with_period(f: &Fixture, quest_id: u32, period_secs: u64) {
+    f.quest
+        .create_quest(&quest_id, &2u32, &50u64, &period_secs);
 }
 
 /// `award`, but returning the contract error instead of panicking.
@@ -140,7 +144,7 @@ fn award_quest_cross_calls_reputation_and_credits_earned() {
     let f = setup();
     let user = Address::generate(&f.env);
 
-    f.quest.create_quest(&1u32, &2u32, &50u64); // quest 1, schema 2, 50 xp
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64); // quest 1, schema 2, 50 xp, one-shot
     award(&f, &f.attester_sk, 1, &user);
 
     // The cross-contract award_xp landed on the EARNED track only.
@@ -154,7 +158,7 @@ fn award_quest_cross_calls_reputation_and_credits_earned() {
 fn award_quest_replay_reverts() {
     let f = setup();
     let user = Address::generate(&f.env);
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     award(&f, &f.attester_sk, 1, &user);
     award(&f, &f.attester_sk, 1, &user); // panics: AlreadyClaimed (replay guard)
 }
@@ -164,7 +168,7 @@ fn award_quest_replay_reverts() {
 fn award_quest_non_allowlisted_attester_reverts() {
     let f = setup();
     let user = Address::generate(&f.env);
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     let imposter = signing_key(99); // valid signature, but pubkey not allowlisted
     award(&f, &imposter, 1, &user); // panics: NotAuthorized
 }
@@ -174,7 +178,7 @@ fn award_quest_non_allowlisted_attester_reverts() {
 fn award_quest_forged_signature_reverts() {
     let f = setup();
     let user = Address::generate(&f.env);
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     // Allowlisted pubkey, but the signature is from a DIFFERENT key — ed25519_verify panics.
     let wrong = signing_key(8);
     let expires_at = f.env.ledger().timestamp() + SIG_TTL;
@@ -197,9 +201,77 @@ fn award_unknown_quest_reverts() {
 fn award_inactive_quest_reverts() {
     let f = setup();
     let user = Address::generate(&f.env);
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     f.quest.set_quest_active(&1u32, &false);
     award(&f, &f.attester_sk, 1, &user); // panics: QuestInactive
+}
+
+// --- Repeatable quests: per-period replay window ---
+
+/// A weekly quest can be completed once per week by the same wallet.
+#[test]
+fn weekly_quest_can_be_completed_once_per_week() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    create_quest_with_period(&f, 1, WEEK);
+
+    set_time(&f, WEEK);
+    award(&f, &f.attester_sk, 1, &user);
+    assert_eq!(f.rep.get_earned(&user), 50);
+
+    // Next week: a fresh signature for the new period is accepted.
+    set_time(&f, 2 * WEEK);
+    award(&f, &f.attester_sk, 1, &user);
+    assert_eq!(f.rep.get_earned(&user), 100);
+}
+
+/// A same-week replay is rejected even with a fresh, valid signature.
+#[test]
+#[should_panic]
+fn weekly_quest_same_week_replay_reverts() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    create_quest_with_period(&f, 1, WEEK);
+
+    set_time(&f, WEEK);
+    award(&f, &f.attester_sk, 1, &user);
+    // Same epoch: the replay guard still holds.
+    award(&f, &f.attester_sk, 1, &user);
+}
+
+/// A signature issued for one period cannot be redeemed in the next.
+#[test]
+fn weekly_signature_is_bound_to_its_period() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    create_quest_with_period(&f, 1, WEEK);
+
+    set_time(&f, WEEK);
+    let expires_at = f.env.ledger().timestamp() + SIG_TTL;
+    let payload = f.quest.quest_payload(&1u32, &user, &expires_at);
+    let sig = sign(&f.env, &f.attester_sk, &payload);
+
+    // Redeeming the week-1 signature in week 2 fails signature verification.
+    set_time(&f, 2 * WEEK);
+    assert_bad_signature(|| {
+        f.quest
+            .award_quest(&f.attester_pub, &sig, &1u32, &user, &expires_at)
+    });
+    assert_eq!(f.rep.get_earned(&user), 0);
+}
+
+/// One-shot quests keep today's permanent replay guard.
+#[test]
+#[should_panic]
+fn one_shot_quest_replay_reverts_across_periods() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    create_quest_with_period(&f, 1, 0);
+
+    set_time(&f, WEEK);
+    award(&f, &f.attester_sk, 1, &user);
+    set_time(&f, 2 * WEEK);
+    award(&f, &f.attester_sk, 1, &user); // panics: AlreadyClaimed
 }
 
 // --- Signature expiry and payload binding (issue #142) ---
@@ -271,7 +343,7 @@ fn to_hex(bytes: &Bytes) -> std::string::String {
 #[test]
 fn a_signature_is_valid_through_its_expiry_and_not_a_second_later() {
     let f = setup();
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     let (early, late) = (Address::generate(&f.env), Address::generate(&f.env));
     let expires_at = THU_2026_10_01 + SIG_TTL;
 
@@ -308,7 +380,7 @@ fn a_signature_is_valid_through_its_expiry_and_not_a_second_later() {
 fn an_unredeemed_signature_does_not_outlive_its_expiry() {
     // The issue's repro: signed at ledger time 0, submitted a year later.
     let f = setup();
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     let user = Address::generate(&f.env);
     set_time(&f, 0);
     let sig = sign(
@@ -332,7 +404,7 @@ fn an_unredeemed_signature_does_not_outlive_its_expiry() {
 #[test]
 fn a_tampered_expiry_fails_signature_verification() {
     let f = setup();
-    f.quest.create_quest(&1u32, &2u32, &50u64);
+    f.quest.create_quest(&1u32, &2u32, &50u64, &0u64);
     let user = Address::generate(&f.env);
     set_time(&f, THU_2026_10_01);
     let signed_until = THU_2026_10_01 + SIG_TTL;
@@ -384,7 +456,11 @@ fn quest_payload_matches_the_documented_bytes() {
         &env,
         "CAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRDB3V",
     );
-    env.register_at(&contract, QuestRegistryContract, ());
+    env.register_at(
+        &contract,
+        QuestRegistryContract,
+        (Address::generate(&env), Address::generate(&env)),
+    );
     let client = QuestRegistryContractClient::new(&env, &contract);
     let classic = Address::from_str(
         &env,
@@ -926,9 +1002,8 @@ fn non_admin_upgrade_reverts() {
     let env = Env::default();
     let admin = Address::generate(&env);
     let rep = Address::generate(&env);
-    let id = env.register(QuestRegistryContract, ());
+    let id = env.register(QuestRegistryContract, (&admin, &rep));
     let client = QuestRegistryContractClient::new(&env, &id);
-    client.init(&admin, &rep);
     let hash = soroban_sdk::BytesN::from_array(&env, &[1; 32]);
     client.upgrade(&hash);
 }
@@ -1170,9 +1245,11 @@ fn binding_keeps_the_replay_guard_and_inactive_check() {
 #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
 fn non_admin_set_quest_attester_reverts() {
     let env = Env::default();
-    let id = env.register(QuestRegistryContract, ());
+    let id = env.register(
+        QuestRegistryContract,
+        (&Address::generate(&env), &Address::generate(&env)),
+    );
     let client = QuestRegistryContractClient::new(&env, &id);
-    client.init(&Address::generate(&env), &Address::generate(&env));
     client.set_quest_attester(&1u32, &BytesN::from_array(&env, &[1; 32]));
 }
 
@@ -1180,9 +1257,11 @@ fn non_admin_set_quest_attester_reverts() {
 #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
 fn non_admin_clear_quest_attester_reverts() {
     let env = Env::default();
-    let id = env.register(QuestRegistryContract, ());
+    let id = env.register(
+        QuestRegistryContract,
+        (&Address::generate(&env), &Address::generate(&env)),
+    );
     let client = QuestRegistryContractClient::new(&env, &id);
-    client.init(&Address::generate(&env), &Address::generate(&env));
     client.clear_quest_attester(&1u32);
 }
 
@@ -1504,9 +1583,11 @@ fn a_quest_bound_key_is_budgeted_too() {
 #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
 fn non_admin_set_attester_budget_reverts() {
     let env = Env::default();
-    let id = env.register(QuestRegistryContract, ());
+    let id = env.register(
+        QuestRegistryContract,
+        (&Address::generate(&env), &Address::generate(&env)),
+    );
     let client = QuestRegistryContractClient::new(&env, &id);
-    client.init(&Address::generate(&env), &Address::generate(&env));
     client.set_attester_budget(&BytesN::from_array(&env, &[1; 32]), &100u64);
 }
 
@@ -1762,9 +1843,12 @@ fn a_weekly_quest_payload_matches_the_documented_bytes() {
         &env,
         "CAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRDB3V",
     );
-    env.register_at(&contract, QuestRegistryContract, ());
+    env.register_at(
+        &contract,
+        QuestRegistryContract,
+        (Address::generate(&env), Address::generate(&env)),
+    );
     let client = QuestRegistryContractClient::new(&env, &contract);
-    client.init(&Address::generate(&env), &Address::generate(&env));
     client.create_quest(&3u32, &2u32, &50u64);
     client.set_quest_period(&3u32, &WEEK);
     let classic = Address::from_str(
@@ -1840,8 +1924,13 @@ fn set_quest_period_validates_and_announces() {
 #[should_panic(expected = "HostError: Error(Auth, InvalidAction)")]
 fn non_admin_set_quest_period_reverts() {
     let env = Env::default();
-    let quest = QuestRegistryContractClient::new(&env, &env.register(QuestRegistryContract, ()));
-    quest.init(&Address::generate(&env), &Address::generate(&env));
+    let quest = QuestRegistryContractClient::new(
+        &env,
+        &env.register(
+            QuestRegistryContract,
+            (&Address::generate(&env), &Address::generate(&env)),
+        ),
+    );
     quest.set_quest_period(&1u32, &WEEK);
 }
 
@@ -1903,4 +1992,27 @@ fn upgrading_keeps_repeatable_quests() {
     set_time(&f, THU_2026_10_01 + WEEK);
     award(&f, &f.attester_sk, 1, &user);
     assert_eq!(f.rep.get_earned(&user), 100);
+}
+
+/// #127: the release build is set up by its constructor, inside the deploy — registering it
+/// takes the constructor's arguments, it has no `init` left for anyone to call afterwards,
+/// and `upgrade` asks the constructor's admin to sign.
+#[test]
+fn the_release_build_is_set_up_by_its_constructor() {
+    use soroban_sdk::IntoVal as _;
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = soroban_sdk::Address::generate(&env);
+    let rep = soroban_sdk::Address::generate(&env);
+    let id = env.register(QUEST_WASM, (&admin, &rep));
+    let init = soroban_sdk::Symbol::new(&env, "init");
+    let impostor = soroban_sdk::Address::generate(&env);
+    let call = soroban_sdk::vec![&env, impostor.into_val(&env)];
+    assert!(env
+        .try_invoke_contract::<(), soroban_sdk::Error>(&id, &init, call)
+        .is_err());
+
+    let hash = env.deployer().upload_contract_wasm(QUEST_WASM);
+    QuestRegistryContractClient::new(&env, &id).upgrade(&hash);
+    assert_eq!(env.auths()[0].0, admin);
 }
