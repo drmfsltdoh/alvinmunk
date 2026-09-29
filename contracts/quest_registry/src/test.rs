@@ -160,6 +160,66 @@ fn award_quest_replay_reverts() {
 }
 
 #[test]
+fn weekly_quest_can_be_completed_once_per_week() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    f.quest.create_quest_periodic(&1u32, &2u32, &50u64, &WEEK_SECS);
+
+    // Week 0: first completion accepted.
+    set_time(&f, 0);
+    award(&f, &f.attester_sk, 1, &user);
+    assert_eq!(f.rep.get_earned(&user), 50);
+
+    // Same week: replay rejected.
+    assert_eq!(
+        try_award(&f, &f.attester_sk, 1, &user),
+        Err(Error::AlreadyClaimed)
+    );
+
+    // Next week: accepted again.
+    set_time(&f, WEEK_SECS);
+    award(&f, &f.attester_sk, 1, &user);
+    assert_eq!(f.rep.get_earned(&user), 100);
+}
+
+#[test]
+fn one_shot_quest_still_rejects_a_later_week() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    f.quest.create_quest(&1u32, &2u32, &50u64);
+    set_time(&f, 0);
+    award(&f, &f.attester_sk, 1, &user);
+    set_time(&f, WEEK_SECS * 5);
+    assert_eq!(
+        try_award(&f, &f.attester_sk, 1, &user),
+        Err(Error::AlreadyClaimed)
+    );
+}
+
+#[test]
+fn a_signature_is_bound_to_its_period() {
+    let f = setup();
+    let user = Address::generate(&f.env);
+    f.quest.create_quest_periodic(&1u32, &2u32, &50u64, &WEEK_SECS);
+
+    // Sign in week 0 with a long expiry, redeem in week 1: the epoch in the payload
+    // no longer matches, so verification fails.
+    set_time(&f, 0);
+    let expires_at = WEEK_SECS * 2;
+    let sig = sign(
+        &f.env,
+        &f.attester_sk,
+        &f.quest.quest_payload(&1u32, &user, &expires_at),
+    );
+    set_time(&f, WEEK_SECS);
+    assert_bad_signature(|| {
+        f.quest
+            .award_quest(&f.attester_pub, &sig, &1u32, &user, &expires_at)
+    });
+    assert_eq!(f.rep.get_earned(&user), 0);
+}
+
+#[test]
 #[should_panic]
 fn award_quest_non_allowlisted_attester_reverts() {
     let f = setup();
