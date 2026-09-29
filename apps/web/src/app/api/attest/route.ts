@@ -46,7 +46,6 @@ import {
   validateEvidence,
   type AttestEvidence,
 } from '../../../lib/attest';
-import { QUEST_PERIOD_SECS } from '../../../lib/quest-period';
 import { json, withRoute } from '../../../lib/api-route';
 // The app's one resolved (and validated) network config — no per-route testnet defaults — so
 // the attester signs for the same network, passphrase and contracts as the client.
@@ -143,13 +142,11 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
     return json({ error: reason }, 422);
   }
 
-  // 3) A quest the recipient already completed in this period can't be awarded again (the
-  // contract's replay guard), so stop before verifying evidence: no GitHub/Horizon/RPC quota
-  // spent and nothing signed. One read of `is_completed`; if it fails or the deployed
-  // contract predates the view, carry on — the on-chain guard still refuses the award.
-  const periodSecs = QUEST_PERIOD_SECS(body.questId);
-  const epoch = periodSecs > 0 ? Math.floor(now / 1000 / periodSecs) : 0;
-  if (await questCompleted(body.questId, body.recipient, epoch)) {
+  // 3) A quest the recipient already completed can't be awarded again (the contract's
+  // replay guard), so stop before verifying evidence: no GitHub/Horizon/RPC quota spent and
+  // nothing signed. One read of `is_completed`; if it fails or the deployed contract
+  // predates the view, carry on — the on-chain guard still refuses the award.
+  if (await questCompleted(body.questId, body.recipient)) {
     return json({ error: 'You’ve already completed this quest.' }, 409);
   }
 
@@ -163,8 +160,8 @@ export const POST = withRoute('POST /api/attest', async (req: Request): Promise<
   try {
     const expiresAt = Math.floor(Date.now() / 1000) + QUEST_SIG_TTL_SECS;
     const ctx = { contractId: QUEST_ID, passphrase: PASSPHRASE };
-    const signed = signQuestPayload(secret, ctx, body.questId, body.recipient, expiresAt, epoch);
-    return json({ ok: true, ...signed, recipient: body.recipient, questId: body.questId, epoch });
+    const signed = signQuestPayload(secret, ctx, body.questId, body.recipient, expiresAt);
+    return json({ ok: true, ...signed, recipient: body.recipient, questId: body.questId });
   } catch (e) {
     return json({ error: e instanceof Error ? e.message : 'sign failed' }, 500);
   }
